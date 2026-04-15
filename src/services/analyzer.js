@@ -1,70 +1,68 @@
 const { ChatOpenAI } = require("@langchain/openai");
 const { PromptTemplate } = require("@langchain/core/prompts");
 const { JsonOutputParser } = require("@langchain/core/output_parsers");
+const { getRepositoryContext } = require("./retriever"); // NEW IMPORT
 require('dotenv').config();
 
 const model = new ChatOpenAI({
     apiKey: process.env.OPENAI_API_KEY,
-    openAIApiKey: process.env.OPENAI_API_KEY,
     modelName: "gpt-4o",
-    temperature: 0
+    temperature: 0.2
 });
 
 async function analyzeDiff(diffText) {
-    // 1. CONTEXT GUARD: If the diff is just metadata or empty, skip the AI call
-    // This prevents the "Please provide a diff" conversational response.
-    if (!diffText || diffText.length < 20 || !diffText.includes('+++')) {
+    console.log("🔍 Starting analysis of the diff...", diffText);
+    if (!diffText) {
         console.log("⚠️ Diff is too small or invalid. Skipping AI analysis.");
         return { hasIssue: false, explanation: "No significant code changes found.", suggestedFix: "" };
     }
 
+    console.log("🔍 Fetching repository context via RAG...");
+    const context = await getRepositoryContext(diffText);
     const parser = new JsonOutputParser();
 
-    // 2. UPDATED PROMPT: We force the LLM to be a JSON engine, not a chatbot.
+    // 🚀 STRICT SCHEMA ENFORCEMENT PROMPT
     const template = `
-        You are a Senior Software Engineer specializing in Code Quality.
+        You are a strict Software Architect reviewing a PULL REQUEST DIFF against the REPOSITORY CONTEXT.
         
         CRITICAL RULES:
-        1. You must ONLY output valid JSON. No conversational text.
-        2. If the Git Diff is empty or unreadable, return: 
-           {{ "hasIssue": false, "explanation": "Invalid Diff", "suggestedFix": "" }}
+        1. You MUST output ONLY valid JSON.
+        2. You MUST use the EXACT keys provided in the schema below. Do NOT invent new keys (e.g., no 'business_logic', no 'missing_updates').
+        3. Do NOT use snake_case. Use camelCase exactly as shown.
         
-        {format_instructions}
+        REQUIRED JSON SCHEMA:
+        {{
+            "hasIssue": true/false, // Set to true if ANY local or global issue is found.
+            "explanation": "Summarize the local syntax/logic issues found inside the diff itself.",
+            "suggestedFix": "Write the corrected code for the DIFF here. If no code fix is needed, return an empty string.",
+            "globalIssues": [ // Array of files broken by this PR. Empty array [] if none.
+                {{
+                    "targetFile": "The file name from context that needs updating.",
+                    "issueDescription": "Why this file is broken by the PR.",
+                    "requiredAction": "What the developer needs to change."
+                }}
+            ]
+        }}
         
-        GIT DIFF TO REVIEW:
+        REPOSITORY CONTEXT (Other files in the system):
+        {context}
+
+        PULL REQUEST DIFF TO REVIEW:
         {diff}
     `;
 
     const prompt = PromptTemplate.fromTemplate(template);
 
     try {
-        // We use a chain for clean output
         const chain = prompt.pipe(model).pipe(parser);
-
         const result = await chain.invoke({
             diff: diffText,
-            format_instructions: parser.getFormatInstructions()
+            context: context || "No broader context available."
         });
-
         return result;
     } catch (error) {
-        console.error("Analysis Error (Attempting manual parse):", error.message);
-
-        // 3. FAILSAFE: If the parser fails, we try one manual parse before giving up
-        try {
-            // Some versions of LangChain might return the raw object in the error
-            if (error.output) {
-                let cleaned = error.output
-                    .replace(/^```json\n?/, "")
-                    .replace(/^```\n?/, "")
-                    .replace(/\n?```$/, "");
-                return JSON.parse(cleaned);
-            }
-        } catch (innerError) {
-            return { hasIssue: false, explanation: "AI returned unparseable content.", suggestedFix: "" };
-        }
-
-        throw error;
+        console.error("Analysis Error:", error.message);
+        return { hasIssue: false, explanation: "AI processing failed.", suggestedFix: "" };
     }
 }
 

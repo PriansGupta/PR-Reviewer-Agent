@@ -9,7 +9,6 @@ const app = express();
 app.use(express.json());
 
 app.post('/webhook', async (req, res) => {
-    // 1. Security Check
     if (!verifyGitHubSignature(req)) {
         console.error("❌ Unauthorized Webhook attempt.");
         return res.status(401).send('Unauthorized');
@@ -26,22 +25,31 @@ app.post('/webhook', async (req, res) => {
 
         try {
             const diff = await getPRData(owner, repo, pullNumber);
+            console.log("📄 Diff fetched successfully. Starting analysis...");
 
-            // 2. Initial Analysis
             let review = await analyzeDiff(diff);
+            console.log("🔍 Analysis complete:", JSON.stringify(review, null, 2));
 
+            // Trust the LLM Contract: we just check hasIssue
             if (review.hasIssue) {
-                // 3. Agentic Loop: Validate the suggested code
-                console.log("🧪 Validating suggested fix...");
-                let validation = await validateFix(review.suggestedFix);
 
-                if (!validation.success) {
-                    console.log("⚠️ Fix failed syntax check. Re-requesting from AI...");
-                    const retryPrompt = `Your previous fix for this diff failed with error: ${validation.error}. Please provide a syntactically correct fix for:\n${diff}`;
-                    review = await analyzeDiff(retryPrompt);
+                // Sandbox Validation (Only if a string of code was provided)
+                if (review.suggestedFix && review.suggestedFix.trim() !== "") {
+                    console.log("🧪 Validating suggested fix...");
+                    let validation = await validateFix(review.suggestedFix);
+
+                    if (!validation.success) {
+                        console.log("⚠️ Fix failed syntax check. Re-requesting from AI...");
+
+                        // 👇 FIX: We explicitly append the original diff so it passes the '+++' check in analyzer.js
+                        const retryPrompt = `Your previous fix failed with the following syntax error:\n${validation.error}\n\nPlease provide a syntactically correct fix for this diff. Use the exact same JSON schema:\n\n${diff}`;
+
+                        review = await analyzeDiff(retryPrompt);
+                    }
+                } else {
+                    console.log("⚠️ No code fix provided. Skipping Sandbox.");
                 }
 
-                // 4. Post the final result
                 await postComment(owner, repo, pullNumber, review);
                 console.log(`✅ Review posted for PR #${pullNumber}`);
             } else {
